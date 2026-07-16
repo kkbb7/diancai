@@ -632,6 +632,17 @@ body {
         <div class="empty-state">暂无订单</div>
       </div>
     </div>
+    <!-- 多设备同步 -->
+    <div class="admin-section" id="syncSection">
+      <h2>☁️ 多设备同步</h2>
+      <div class="add-form" style="padding:10px 14px">
+        <input type="password" id="syncToken" placeholder="输入 GitHub Token 开启同步" autocomplete="off" style="flex:3">
+        <button class="btn-add-dish" id="btnSaveToken" style="flex:0">保存</button>
+      </div>
+      <div style="padding:0 14px 10px;font-size:0.7rem;color:var(--text-soft)">
+        <span id="tokenStatus">⚠ 未配置 Token：可查看云端数据，但不能修改</span>
+      </div>
+    </div>
   </div>
 
   <!-- ========================================================
@@ -652,7 +663,10 @@ body {
   </div>
 
   <!-- 底部提示 -->
-  <div class="footer-note" id="footerNote">📱 浏览器菜单 → 「添加到主屏幕」可像APP一样使用</div>
+  <div class="footer-note" id="footerNote">
+    <span id="syncDot" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#ccc;margin-right:3px;vertical-align:middle"></span>
+    <span id="syncLabel">同步中…</span> · 浏览器菜单 → 「添加到主屏幕」
+  </div>
 
   <!-- 密码弹窗 -->
   <div class="modal-overlay" id="pwModal">
@@ -777,7 +791,7 @@ function generateFoodImage(name) {
 }
 
 // ============================================================
-// 数据模型 & localStorage
+// 数据模型 & 云端同步
 // ============================================================
 const KEYS = {
   menu:   'diancai_menu',
@@ -795,7 +809,7 @@ const DEFAULT_MENU = [
   { name: '可乐',     price: 8  },
 ];
 
-function loadData(key, fallback) {
+function loadLocal(key, fallback) {
   try {
     const raw = localStorage.getItem(key);
     if (raw !== null) return JSON.parse(raw);
@@ -804,36 +818,130 @@ function loadData(key, fallback) {
 }
 function saveData(key, data) {
   localStorage.setItem(key, JSON.stringify(data));
+  if (key === KEYS.menu || key === KEYS.orders) {
+    clearTimeout(_syncTimer);
+    _syncTimer = setTimeout(syncPush, 800);
+  }
+}
+let _syncTimer = null;
+
+// 云端配置（Token 从 localStorage 读取）
+function cloudCfg() {
+  return {
+    token: localStorage.getItem('diancai_gh_token') || '',
+    raw:   'https://kkbb7.github.io/diancai',
+    api:   'https://api.github.com/repos/kkbb7/diancai/contents',
+  };
 }
 
-// 初始化
-let menu   = loadData(KEYS.menu, null);
-let cart   = loadData(KEYS.cart, []);
-let orders = loadData(KEYS.orders, []);
+// 拉取云端数据
+async function syncPull() {
+  const $dot = document.getElementById('syncDot');
+  const $lbl = document.getElementById('syncLabel');
+  const cfg = cloudCfg();
+  try {
+    if ($dot) { $dot.style.background = '#FFA500'; }
+    if ($lbl) { $lbl.textContent = '同步中…'; }
+    const t = Date.now();
+    const [mR, oR] = await Promise.all([
+      fetch(cfg.raw + '/menu.json?t=' + t, { cache: 'no-cache' }),
+      fetch(cfg.raw + '/orders.json?t=' + t, { cache: 'no-cache' })
+    ]);
+    let chg = false;
+    if (mR.ok) {
+      const d = await mR.json();
+      if (Array.isArray(d) && d.length > 0) {
+        d.forEach(x => { if (!x.img) x.img = generateFoodImage(x.name); });
+        localStorage.setItem(KEYS.menu, JSON.stringify(d));
+        menu = d; chg = true;
+      }
+    }
+    if (oR.ok) {
+      const d = await oR.json();
+      if (Array.isArray(d)) {
+        localStorage.setItem(KEYS.orders, JSON.stringify(d));
+        orders = d; chg = true;
+      }
+    }
+    if ($dot) { $dot.style.background = '#3CB371'; }
+    if ($lbl) { $lbl.textContent = '已同步'; }
+    return chg;
+  } catch (_) {
+    if ($dot) { $dot.style.background = '#E05555'; }
+    if ($lbl) { $lbl.textContent = '离线'; }
+    return false;
+  }
+}
+
+// 推送本地数据到云端
+async function syncPush() {
+  const $dot = document.getElementById('syncDot');
+  const $lbl = document.getElementById('syncLabel');
+  const cfg = cloudCfg();
+  if (!cfg.token) return;
+  try {
+    if ($dot) { $dot.style.background = '#FFA500'; }
+    if ($lbl) { $lbl.textContent = '推送中…'; }
+    const files = [
+      { path: 'menu.json',   data: JSON.stringify(menu.map(d => ({ id:d.id, name:d.name, price:d.price, img:d.img })), null, 2) },
+      { path: 'orders.json', data: JSON.stringify(orders, null, 2) },
+    ];
+    for (const f of files) {
+      const gR = await fetch(cfg.api + '/' + f.path, { headers: { Authorization: 'token ' + cfg.token } });
+      const gJ = await gR.json();
+      if (!gJ.sha) continue;
+      await fetch(cfg.api + '/' + f.path, {
+        method: 'PUT',
+        headers: { Authorization: 'token ' + cfg.token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: 'sync ' + f.path, content: btoa(unescape(encodeURIComponent(f.data))), sha: gJ.sha })
+      });
+    }
+    await new Promise(r => setTimeout(r, 1500));
+    await syncPull();
+  } catch (_) {}
+}
+
+// 初始化数据
+let menu   = loadLocal(KEYS.menu, null);
+let cart   = loadLocal(KEYS.cart, []);
+let orders = loadLocal(KEYS.orders, []);
 
 if (!menu || !Array.isArray(menu) || menu.length === 0) {
-  menu = DEFAULT_MENU.map((d, i) => ({
-    id:  Date.now() + i,
-    name: d.name,
-    price: d.price,
-    img:  null, // 延迟生成
-  }));
-  // 为每个菜品生成图片
+  menu = DEFAULT_MENU.map((d, i) => ({ id: Date.now() + i, name: d.name, price: d.price, img: null }));
   menu.forEach(d => { d.img = generateFoodImage(d.name); });
   saveData(KEYS.menu, menu);
 } else {
-  // 确保每个菜品都有 img
   let changed = false;
-  menu.forEach(d => {
-    if (!d.img) { d.img = generateFoodImage(d.name); changed = true; }
-  });
+  menu.forEach(d => { if (!d.img) { d.img = generateFoodImage(d.name); changed = true; } });
   if (changed) saveData(KEYS.menu, menu);
 }
 
 let nextId = menu.length > 0 ? Math.max(...menu.map(d => d.id)) + 1 : 1;
-
-// 未读订单计数（用于徽标）
 let lastSeenOrderCount = orders.length;
+
+// 启动时从云端拉取
+syncPull().then(chg => {
+  if (chg) {
+    nextId = menu.length > 0 ? Math.max(...menu.map(d => d.id)) + 1 : 1;
+    lastSeenOrderCount = orders.length;
+    if (currentTab === 'menu') renderMenu();
+    if (currentTab === 'admin') renderAdmin();
+    updateBadges();
+  }
+});
+
+// 每 8 秒自动同步
+setInterval(async () => {
+  const chg = await syncPull();
+  if (chg) {
+    nextId = menu.length > 0 ? Math.max(...menu.map(d => d.id)) + 1 : 1;
+    lastSeenOrderCount = orders.length;
+    if (currentTab === 'menu') renderMenu();
+    if (currentTab === 'admin') renderAdmin();
+    if (currentTab === 'cart') renderCart();
+    updateBadges();
+  }
+}, 8000);
 
 // ============================================================
 // DOM 引用
@@ -1188,6 +1296,7 @@ document.addEventListener('click', function requestNotify() {
 function renderAdmin() {
   renderAdminDishes();
   renderOrders();
+  updateTokenUI();
 }
 
 // 管理端菜品列表
@@ -1370,6 +1479,41 @@ $btnAddDish.addEventListener('click', () => {
 // 回车快捷添加
 $admPrice.addEventListener('keydown', e => { if (e.key === 'Enter') $btnAddDish.click(); });
 $admName.addEventListener('keydown', e => { if (e.key === 'Enter') $admPrice.focus(); });
+
+// -- 同步 Token 管理 --
+const $syncToken    = document.getElementById('syncToken');
+const $btnSaveToken = document.getElementById('btnSaveToken');
+const $tokenStatus  = document.getElementById('tokenStatus');
+
+function updateTokenUI() {
+  const t = localStorage.getItem('diancai_gh_token');
+  if (t) {
+    $syncToken.placeholder = '已配置（可修改）';
+    $tokenStatus.innerHTML = '✅ Token 已配置，数据自动同步到云端';
+    $tokenStatus.style.color = '#3CB371';
+  } else {
+    $syncToken.placeholder = '输入 GitHub Token 开启同步';
+    $tokenStatus.innerHTML = '⚠ 未配置 Token：可查看云端数据，但不能修改';
+    $tokenStatus.style.color = 'var(--text-soft)';
+  }
+}
+updateTokenUI();
+
+$btnSaveToken.addEventListener('click', () => {
+  const v = $syncToken.value.trim();
+  if (!v) { alert('请粘贴 GitHub Token'); return; }
+  if (!v.startsWith('ghp_') && !v.startsWith('github_pat_')) {
+    alert('Token 格式不正确，应以 ghp_ 或 github_pat_ 开头'); return;
+  }
+  localStorage.setItem('diancai_gh_token', v);
+  $syncToken.value = '';
+  updateTokenUI();
+  syncPush();
+  alert('✅ Token 已保存，数据将自动同步');
+});
+$syncToken.addEventListener('keydown', e => {
+  if (e.key === 'Enter') $btnSaveToken.click();
+});
 
 // 订单列表
 function renderOrders() {
