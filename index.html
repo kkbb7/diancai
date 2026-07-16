@@ -834,7 +834,7 @@ function cloudCfg() {
   };
 }
 
-// 拉取云端数据
+// 拉取云端数据：优先用 API（实时），无 Token 时用 raw（可能有缓存延迟）
 async function syncPull() {
   const $dot = document.getElementById('syncDot');
   const $lbl = document.getElementById('syncLabel');
@@ -842,26 +842,42 @@ async function syncPull() {
   try {
     if ($dot) { $dot.style.background = '#FFA500'; }
     if ($lbl) { $lbl.textContent = '同步中…'; }
-    const t = Date.now();
-    const [mR, oR] = await Promise.all([
-      fetch(cfg.raw + '/menu.json?t=' + t, { cache: 'no-cache' }),
-      fetch(cfg.raw + '/orders.json?t=' + t, { cache: 'no-cache' })
-    ]);
-    let chg = false;
-    if (mR.ok) {
-      const d = await mR.json();
-      if (Array.isArray(d) && d.length > 0) {
-        d.forEach(x => { if (!x.img) x.img = generateFoodImage(x.name); });
-        localStorage.setItem(KEYS.menu, JSON.stringify(d));
-        menu = d; chg = true;
+    let mData = null, oData = null;
+
+    if (cfg.token) {
+      // 有 Token：直接从 API 拉取（无缓存，实时）
+      const [mR, oR] = await Promise.all([
+        fetch(cfg.api + '/menu.json', { headers: { Authorization: 'token ' + cfg.token, 'Cache-Control': 'no-cache' } }),
+        fetch(cfg.api + '/orders.json', { headers: { Authorization: 'token ' + cfg.token, 'Cache-Control': 'no-cache' } })
+      ]);
+      if (mR.ok) {
+        const j = await mR.json();
+        if (j.content) mData = JSON.parse(decodeURIComponent(escape(atob(j.content))));
       }
+      if (oR.ok) {
+        const j = await oR.json();
+        if (j.content) oData = JSON.parse(decodeURIComponent(escape(atob(j.content))));
+      }
+    } else {
+      // 无 Token：从 raw 拉取（可能延迟）
+      const t = Date.now();
+      const [mR, oR] = await Promise.all([
+        fetch('https://raw.githubusercontent.com/kkbb7/diancai/main/menu.json?t=' + t, { cache: 'no-cache' }),
+        fetch('https://raw.githubusercontent.com/kkbb7/diancai/main/orders.json?t=' + t, { cache: 'no-cache' })
+      ]);
+      if (mR.ok) mData = await mR.json();
+      if (oR.ok) oData = await oR.json();
     }
-    if (oR.ok) {
-      const d = await oR.json();
-      if (Array.isArray(d)) {
-        localStorage.setItem(KEYS.orders, JSON.stringify(d));
-        orders = d; chg = true;
-      }
+
+    let chg = false;
+    if (mData && Array.isArray(mData) && mData.length > 0) {
+      mData.forEach(x => { if (!x.img) x.img = generateFoodImage(x.name); });
+      localStorage.setItem(KEYS.menu, JSON.stringify(mData));
+      menu = mData; chg = true;
+    }
+    if (oData && Array.isArray(oData)) {
+      localStorage.setItem(KEYS.orders, JSON.stringify(oData));
+      orders = oData; chg = true;
     }
     if ($dot) { $dot.style.background = '#3CB371'; }
     if ($lbl) { $lbl.textContent = '已同步'; }
@@ -878,7 +894,10 @@ async function syncPush() {
   const $dot = document.getElementById('syncDot');
   const $lbl = document.getElementById('syncLabel');
   const cfg = cloudCfg();
-  if (!cfg.token) return;
+  if (!cfg.token) {
+    if ($lbl) $lbl.textContent = '需配置Token';
+    return;
+  }
   try {
     if ($dot) { $dot.style.background = '#FFA500'; }
     if ($lbl) { $lbl.textContent = '推送中…'; }
@@ -889,16 +908,18 @@ async function syncPush() {
     for (const f of files) {
       const gR = await fetch(cfg.api + '/' + f.path, { headers: { Authorization: 'token ' + cfg.token } });
       const gJ = await gR.json();
-      if (!gJ.sha) continue;
-      await fetch(cfg.api + '/' + f.path, {
+      if (!gJ.sha) { console.warn('syncPush: no sha for', f.path, gJ); continue; }
+      const r = await fetch(cfg.api + '/' + f.path, {
         method: 'PUT',
         headers: { Authorization: 'token ' + cfg.token, 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: 'sync ' + f.path, content: btoa(unescape(encodeURIComponent(f.data))), sha: gJ.sha })
       });
+      if (!r.ok) console.warn('syncPush: PUT failed', r.status, await r.text());
     }
-    await new Promise(r => setTimeout(r, 1500));
+    // 推送成功后立刻从 API 拉回确认
+    await new Promise(r2 => setTimeout(r2, 1000));
     await syncPull();
-  } catch (_) {}
+  } catch (e) { console.warn('syncPush error:', e); }
 }
 
 // 初始化数据
